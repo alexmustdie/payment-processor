@@ -87,24 +87,29 @@ async def process_payment(sessions, settings, event, client, gateway=emulate_gat
             if not is_current(payment, event):
                 return
             event_id = f"payment:{payment.id}:result"
-            response = await client.post(
-                payment.webhook_url,
-                json={
-                    "event_id": event_id,
-                    "payment_id": str(payment.id),
-                    "status": payment.status,
-                    "amount": format(payment.amount, ".2f"),
-                    "currency": payment.currency,
-                    "description": payment.description,
-                    "metadata": payment.metadata_,
-                    "created_at": payment.created_at.isoformat(),
-                    "processed_at": payment.processed_at.isoformat(),
-                },
-                headers={"Idempotency-Key": event_id},
-                timeout=settings.webhook_timeout_seconds,
-                follow_redirects=False,
-            )
-            response.raise_for_status()
+            payload = {
+                "event_id": event_id,
+                "payment_id": str(payment.id),
+                "status": payment.status,
+                "amount": format(payment.amount, ".2f"),
+                "currency": payment.currency,
+                "description": payment.description,
+                "metadata": payment.metadata_,
+                "created_at": payment.created_at.isoformat(),
+                "processed_at": payment.processed_at.isoformat(),
+            }
+            # HTTPX timeouts limit inactivity, not the entire exchange. Bound both,
+            # and do not download a webhook response body that we never use.
+            async with asyncio.timeout(settings.webhook_timeout_seconds):
+                async with client.stream(
+                    "POST",
+                    payment.webhook_url,
+                    json=payload,
+                    headers={"Idempotency-Key": event_id},
+                    timeout=settings.webhook_timeout_seconds,
+                    follow_redirects=False,
+                ) as response:
+                    response.raise_for_status()
             payment.attempts = event.attempt
             payment.webhook_delivered_at = datetime.now(UTC)
             payment.last_error = None

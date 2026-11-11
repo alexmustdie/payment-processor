@@ -8,9 +8,9 @@ Python 3.12.16, PostgreSQL 17, RabbitMQ 4.1. Проверки выполнены
 
 | Проверка | Результат |
 | --- | --- |
-| `uv run python -m pytest -q` | 38 passed |
+| `uv run python -m pytest -q` | 53 passed |
 | `uv run ruff check .` | All checks passed |
-| `uv run ruff format --check .` | 22 files already formatted |
+| `uv run ruff format --check .` | Все Python-файлы отформатированы |
 | Alembic `downgrade base` -> `upgrade head` в тестовой БД | Успешно |
 | Alembic `check` | No new upgrade operations detected |
 | `docker compose config --quiet` | Успешно |
@@ -31,6 +31,13 @@ Python 3.12.16, PostgreSQL 17, RabbitMQ 4.1. Проверки выполнены
    отказ публикации, сбой после broker confirm до коммита outbox.
 7. Relay: `SKIP LOCKED` для параллельных издателей, запрет ранней публикации retry.
 8. Consumer: неверная схема сообщения, ошибка хранилища, отмена при остановке.
+9. Граничные JSON-значения: вложенные NaN/Infinity, NUL и некорректный Unicode
+   в строках и ключах дают корректный `422`, не создавая платеж/outbox;
+   валидные вложенные данные с Unicode сохраняются без изменений.
+10. Webhook ограничен общим временем HTTP-операции; ненужное тело ответа
+    не скачивается. Медленные заголовки приводят к сохранению retry.
+11. Отмена consumer во время инфраструктурной паузы выполняет NACK/requeue,
+    а не ошибочную отправку в DLQ.
 
 ## Сквозной сценарий с настоящими сервисами
 

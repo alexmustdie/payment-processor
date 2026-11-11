@@ -31,3 +31,25 @@ async def test_shutdown_cancellation_requeues(monkeypatch):
         await consumer.handle_payment({"payment_id": str(uuid4()), "attempt": 1}, message)
     message.nack.assert_awaited_once_with(requeue=True)
     message.reject.assert_not_awaited()
+
+
+async def test_cancellation_during_infrastructure_backoff_requeues(monkeypatch):
+    backoff_started = asyncio.Event()
+
+    async def backoff(_):
+        backoff_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(consumer, "process_payment", AsyncMock(side_effect=ConnectionError))
+    monkeypatch.setattr(consumer.asyncio, "sleep", backoff)
+    message = AsyncMock()
+    task = asyncio.create_task(
+        consumer.handle_payment({"payment_id": str(uuid4()), "attempt": 1}, message)
+    )
+    await asyncio.wait_for(backoff_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    message.nack.assert_awaited_once_with(requeue=True)
+    message.reject.assert_not_awaited()
+    message.ack.assert_not_awaited()

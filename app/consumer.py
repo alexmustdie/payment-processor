@@ -36,17 +36,19 @@ async def shutdown():
 @broker.subscriber(PAYMENTS_QUEUE, PAYMENTS_EXCHANGE, ack_policy=AckPolicy.REJECT_ON_ERROR)
 async def handle_payment(body: Any, message: RabbitMessage):
     try:
-        event = PaymentEvent.model_validate(body)
-        await process_payment(sessions, settings, event, client)
-    except (ValidationError, InvalidPaymentEvent):
-        logger.warning("Invalid payment message rejected")
-        await message.reject()
+        try:
+            event = PaymentEvent.model_validate(body)
+            await process_payment(sessions, settings, event, client)
+        except (ValidationError, InvalidPaymentEvent):
+            logger.warning("Invalid payment message rejected")
+            await message.reject()
+        except Exception as exc:
+            logger.warning("Payment infrastructure unavailable: %s", type(exc).__name__)
+            await asyncio.sleep(1)
+            await message.nack(requeue=True)
+        else:
+            await message.ack()
     except asyncio.CancelledError:
+        # Include cancellation during backoff/ACK, not only during payment processing.
         await message.nack(requeue=True)
         raise
-    except Exception as exc:
-        logger.warning("Payment infrastructure unavailable: %s", type(exc).__name__)
-        await asyncio.sleep(1)
-        await message.nack(requeue=True)
-    else:
-        await message.ack()

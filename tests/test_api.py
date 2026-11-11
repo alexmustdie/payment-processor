@@ -1,4 +1,5 @@
 import asyncio
+import json
 from uuid import uuid4
 
 import pytest
@@ -117,3 +118,48 @@ async def test_payment_rolls_back_if_outbox_insert_fails(sessions, payload):
     async with sessions() as session:
         assert await session.scalar(select(func.count()).select_from(Payment)) == 0
         assert await session.scalar(select(func.count()).select_from(Outbox)) == 0
+
+
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"amount": float("nan")},
+        {"metadata": {"nested": [{"value": float("inf")}]}},
+        {"metadata": {"nested": [float("-inf")]}},
+        {"metadata": {"nested": [float("nan")]}},
+        {"description": "before\x00after"},
+        {"description": "\ud800"},
+        {"metadata": {"nested": ["before\x00after"]}},
+        {"metadata": {"nested": [{"value": "\udfff"}]}},
+        {"metadata": {"\x00": "value"}},
+        {"metadata": {"\ud800": "value"}},
+        {"\ud800": "unexpected"},
+    ],
+)
+async def test_storage_incompatible_json_returns_422_without_side_effects(
+    client, sessions, payload, patch
+):
+    # Raw JSON exercises malformed numeric/Unicode values without HTTPX filtering them.
+    response = await client.post(
+        "/api/v1/payments",
+        content=json.dumps({**payload, **patch}, ensure_ascii=True),
+        headers={"Idempotency-Key": "bad-json", "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]
+    assert all("input" not in error and "ctx" not in error for error in response.json()["detail"])
+    async with sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(Payment)) == 0
+        assert await session.scalar(select(func.count()).select_from(Outbox)) == 0
+
+
+async def test_nested_unicode_metadata_round_trips(client, payload):
+    metadata = {"заказ": [None, True, 1, 1.5, {"название": "Кофе ☕"}]}
+    response = await client.post(
+        "/api/v1/payments",
+        json={**payload, "metadata": metadata},
+        headers={"Idempotency-Key": "unicode"},
+    )
+    assert response.status_code == 202
+    details = await client.get(f"/api/v1/payments/{response.json()['payment_id']}")
+    assert details.json()["metadata"] == metadata

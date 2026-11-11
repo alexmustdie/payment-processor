@@ -116,7 +116,7 @@ async def test_gateway_exceptions_eventually_dead_letter(sessions, settings, pay
             gateway,
         )
     assert gateway.await_count == 3
-    client.post.assert_not_awaited()
+    client.stream.assert_not_called()
     async with sessions() as session:
         result = await session.get(Payment, payment.id)
         assert result.status == "pending"
@@ -165,14 +165,77 @@ async def test_concurrent_duplicate_processing_calls_gateway_and_webhook_once(
 ):
     payment = await make_payment(sessions, payload)
     gateway = AsyncMock(return_value="succeeded")
-    client = AsyncMock()
-    client.post.return_value = httpx.Response(
-        204, request=httpx.Request("POST", payload["webhook_url"])
-    )
+    requests = []
+
+    def receiver(request):
+        requests.append(request)
+        return httpx.Response(204)
+
     event = PaymentEvent(payment_id=payment.id)
-    await asyncio.gather(
-        process_payment(sessions, settings, event, client, gateway),
-        process_payment(sessions, settings, event, client, gateway),
-    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receiver)) as client:
+        await asyncio.gather(
+            process_payment(sessions, settings, event, client, gateway),
+            process_payment(sessions, settings, event, client, gateway),
+        )
     gateway.assert_awaited_once()
-    client.post.assert_awaited_once()
+    assert len(requests) == 1
+
+
+async def test_total_webhook_deadline_records_retry(sessions, settings, payload):
+    payment = await make_payment(sessions, payload)
+    settings = settings.model_copy(update={"webhook_timeout_seconds": 0.03})
+
+    async def receiver(request):
+        # This transport ignores HTTPX's I/O timeout: the outer deadline must cancel it.
+        await asyncio.Event().wait()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(receiver)) as client:
+        async with asyncio.timeout(2):
+            await process_payment(
+                sessions,
+                settings,
+                PaymentEvent(payment_id=payment.id),
+                client,
+                AsyncMock(return_value="succeeded"),
+            )
+    async with sessions() as session:
+        result = await session.get(Payment, payment.id)
+        assert result.status == "succeeded"
+        assert result.webhook_delivered_at is None
+        assert result.attempts == 1
+        assert result.last_error == "TimeoutError"
+        events = (await session.scalars(select(Outbox))).all()
+        assert any(event.payload["attempt"] == 2 for event in events)
+
+
+async def test_webhook_response_body_is_not_downloaded(sessions, settings, payload):
+    payment = await make_payment(sessions, payload)
+
+    class UnusedBody(httpx.AsyncByteStream):
+        read = False
+        closed = False
+
+        async def __aiter__(self):
+            self.read = True
+            yield b"unneeded response body"
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            self.closed = True
+
+    body = UnusedBody()
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=body))
+    async with httpx.AsyncClient(transport=transport) as client:
+        async with asyncio.timeout(2):
+            await process_payment(
+                sessions,
+                settings,
+                PaymentEvent(payment_id=payment.id),
+                client,
+                AsyncMock(return_value="succeeded"),
+            )
+    assert not body.read
+    assert body.closed
+    async with sessions() as session:
+        result = await session.get(Payment, payment.id)
+        assert result.webhook_delivered_at is not None

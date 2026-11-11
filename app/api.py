@@ -1,11 +1,14 @@
 import asyncio
+import json
 import secrets
 from contextlib import asynccontextmanager, suppress
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Security
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import Response
 from fastapi.security import APIKeyHeader
 
 from app.config import Settings
@@ -50,6 +53,24 @@ def create_app(settings: Settings | None = None, *, relay_enabled: bool = True) 
     )
     app.state.engine = engine
     app.state.sessions = sessions
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request, exc):
+        # Raw input/context may contain non-finite numbers, invalid Unicode or secrets.
+        return Response(
+            status_code=422,
+            media_type="application/json",
+            content=json.dumps(
+                {
+                    "detail": [
+                        {"loc": error["loc"], "msg": error["msg"], "type": error["type"]}
+                        for error in exc.errors()
+                    ]
+                },
+                ensure_ascii=True,
+                allow_nan=False,
+            ),
+        )
 
     @app.get("/openapi.json", include_in_schema=False)
     async def schema():
